@@ -576,26 +576,26 @@ function makeSide(side){
   }
 
   async function connectBLE(){
-    if(!('bluetooth' in navigator)){alert('Web Bluetooth requires Chrome or Edge.');return;}
     try{
-      conn.bleDevice=await navigator.bluetooth.requestDevice({
-        acceptAllDevices:true,
-        optionalServices:[NUS_SERVICE]
+      await ensureWS();
+      log(side+' scanning...');
+      const _side=side;
+      ws.send(JSON.stringify({cmd:'scan',side:_side}));
+      const devices=await new Promise((res,rej)=>{
+        scanCallback=res;
+        setTimeout(()=>rej(new Error('Scan timeout')),8000);
       });
-      conn.bleDevice.addEventListener('gattserverdisconnected',()=>{
-        conn.bleDevice=null;conn.bleChar=null;
-        clearCOP();setStatus('Disconnected',false);log(side+' BLE disconnected');
-      });
-      const server=await conn.bleDevice.gatt.connect();
-      const service=await server.getPrimaryService(NUS_SERVICE);
-      conn.bleChar=await service.getCharacteristic(NUS_TX);
-      const parser=makeParser();
-      conn.bleChar.addEventListener('characteristicvaluechanged',e=>{
-        parser(new TextDecoder().decode(e.target.value));
-      });
-      await conn.bleChar.startNotifications();
-      setStatus('BLE',true);log(side+' BLE connected');
-    }catch(e){log(side+' BLE: '+e.message);}
+      if(devices.length===0){log('No Pressure devices found.');return;}
+      let chosen=devices[0];
+      if(devices.length>1){
+        const names=devices.map((d,i)=>(i+1)+': '+d.name).join('\n');
+        const idx=parseInt(prompt('Select device:\n'+names))-1;
+        if(isNaN(idx)||idx<0||idx>=devices.length)return;
+        chosen=devices[idx];
+      }
+      log('Connecting to '+chosen.name+'...');
+      ws.send(JSON.stringify({cmd:'connect',side:_side,address:chosen.address}));
+    }catch(e){log('BLE bridge: '+e.message+' — make sure ble_bridge.py is running');}
   }
 
   async function connectSerial(){
@@ -642,6 +642,51 @@ function makeSide(side){
   document.getElementById('btn-'+p+'-disc').onclick=disconnect;
 
   return {update,updateIMU,clearCOP,syncCanvas,buildDots,parseLine:makeParser(),setStatus};
+}
+
+// WebSocket BLE bridge
+let ws=null;
+let scanCallback=null;
+
+function ensureWS(){
+  if(ws&&ws.readyState===WebSocket.OPEN)return Promise.resolve();
+  return new Promise((res,rej)=>{
+    ws=new WebSocket('ws://localhost:8765');
+    ws.onopen=()=>{log('Bridge connected');res();};
+    ws.onerror=()=>rej(new Error('Bridge not running'));
+    ws.onmessage=e=>{
+      const msg=JSON.parse(e.data);
+      if(msg.type==='scan_result'){
+        if(scanCallback){scanCallback(msg.devices);scanCallback=null;}
+      } else if(msg.type==='device_list'){
+        // show picker
+        const devs=msg.devices;
+        if(devs.length===0){log('No Pressure devices found.');return;}
+        let chosen=devs[0];
+        if(devs.length>1){
+          const names=devs.map((d,i)=>(i+1)+': '+d.name).join('\n');
+          const idx=parseInt(prompt('Select device:\n'+names))-1;
+          if(isNaN(idx)||idx<0||idx>=devs.length)return;
+          chosen=devs[idx];
+        }
+        const side=msg.side;
+        log('Connecting to '+chosen.name+'...');
+        ws.send(JSON.stringify({cmd:'connect',side,address:chosen.address}));
+      } else if(msg.type==='data'){
+        const side=sides[msg.side];
+        if(side)side.parseLine(msg.line);
+      } else if(msg.type==='ble_connected'){
+        const s=sides[msg.side];
+        if(s){s.setStatus('BLE',true);log(msg.side+' BLE connected');}
+      } else if(msg.type==='ble_disconnected'){
+        const s=sides[msg.side];
+        if(s){s.clearCOP();s.setStatus('Disconnected',false);log(msg.side+' BLE disconnected');}
+      } else if(msg.type==='error'){
+        log('Bridge: '+msg.msg);
+      }
+    };
+    ws.onclose=()=>log('Bridge disconnected');
+  });
 }
 
 const sides={L:makeSide('L'), R:makeSide('R')};
